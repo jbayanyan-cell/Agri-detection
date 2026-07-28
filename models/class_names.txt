@@ -1,0 +1,6 @@
+brown-planthopper
+green-leafhopper
+leaf-folder
+rice-bug
+stem-borer
+whorl-maggot

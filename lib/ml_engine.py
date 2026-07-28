@@ -1,4 +1,4 @@
-"""Shared ONNX pest detection engine for Vercel serverless."""
+"""Shared ONNX pest detection engine for Vercel (YOLOv5 rice-pests model)."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import os
 import time
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from PIL import Image
@@ -19,19 +19,23 @@ except ImportError:
     ONNX_AVAILABLE = False
     ort = None  # type: ignore
 
+# Order must match Roboflow common-rice-pests-philippines/11 class_names.txt
 CLASS_NAMES = [
-    "Rice_Bug",
-    "White stem borer",
-    "black-bug",
-    "brown_hopper",
-    "green_hopper",
+    "brown-planthopper",
+    "green-leafhopper",
+    "leaf-folder",
+    "rice-bug",
+    "stem-borer",
+    "whorl-maggot",
 ]
 
 PESTICIDE_RECS = {
-    "Rice_Bug": "Use lambda-cyhalothrin or beta-cyfluthrin per label; avoid spraying near harvest.",
-    "green_hopper": "Imidacloprid or dinotefuran early; rotate MoA to avoid resistance.",
-    "brown_hopper": "Buprofezin or pymetrozine; reduce nitrogen; avoid broad-spectrum pyrethroids.",
-    "black-bug": "Carbaryl dust or fipronil bait at tillering; field sanitation recommended.",
+    "brown-planthopper": "Buprofezin or pymetrozine; reduce nitrogen; avoid broad-spectrum pyrethroids.",
+    "green-leafhopper": "Imidacloprid or dinotefuran early; rotate MoA to avoid resistance.",
+    "leaf-folder": "Use cartap or chlorantraniliprole when leaf damage is rising; conserve natural enemies.",
+    "rice-bug": "Use lambda-cyhalothrin or beta-cyfluthrin per label; avoid spraying near harvest.",
+    "stem-borer": "Use chlorantraniliprole or cartap early; remove stubbles after harvest.",
+    "whorl-maggot": "Apply early protective insecticide if damage is severe; improve field drainage.",
 }
 
 _session = None
@@ -46,7 +50,13 @@ def _project_root() -> Path:
 
 def _model_candidates() -> list[Path]:
     root = _project_root()
-    names = ["best 2.onnx", "best.onnx", "best5.onnx"]
+    # Prefer the bundled Roboflow YOLOv5 export
+    names = [
+        "yolov5s_weights.onnx",
+        "best.onnx",
+        "best 2.onnx",
+        "best5.onnx",
+    ]
     candidates: list[Path] = []
     for name in names:
         candidates.append(root / "models" / name)
@@ -70,8 +80,6 @@ def find_onnx_model() -> str:
         cache_dir = Path("/tmp/agrishield_models")
         cache_dir.mkdir(parents=True, exist_ok=True)
         dest = cache_dir / "model.onnx"
-        # Refresh from PHP active-model URL on each cold start so Deploy updates take effect.
-        # Set MODEL_CACHE_TTL_SECONDS (default 0 = always refresh) to keep a short cache.
         ttl = int(os.getenv("MODEL_CACHE_TTL_SECONDS", "0") or "0")
         need_download = True
         if dest.exists() and ttl > 0:
@@ -87,7 +95,7 @@ def find_onnx_model() -> str:
         return str(dest)
 
     raise FileNotFoundError(
-        "ONNX model not found. Add models/best.onnx or set MODEL_URL env var."
+        "ONNX model not found. Add models/yolov5s_weights.onnx or set MODEL_URL."
     )
 
 
@@ -97,6 +105,7 @@ def load_onnx_model(model_path: str):
 
     sess = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
     input_details = sess.get_inputs()[0]
+    # YOLOv5 exports several outputs; use the concatenated detections tensor
     output_details = sess.get_outputs()[0]
     return sess, input_details, output_details
 
@@ -116,15 +125,16 @@ def get_model() -> Tuple[Any, Any, Any, Optional[str]]:
 
 
 def preprocess_image(image: Image.Image, input_shape: tuple) -> np.ndarray:
+    """Letterbox-free stretch resize (matches Roboflow 'Stretch to' 416x416)."""
     if len(input_shape) == 4:
         if input_shape[1] == 3:
-            h, w = input_shape[2], input_shape[3]
+            h, w = int(input_shape[2]), int(input_shape[3])
         else:
-            h, w = input_shape[1], input_shape[2]
+            h, w = int(input_shape[1]), int(input_shape[2])
     else:
-        h, w = 512, 512
+        h, w = 416, 416
 
-    img = image.resize((w, h))
+    img = image.resize((w, h), Image.BILINEAR)
     img_array = np.array(img, dtype=np.float32) / 255.0
 
     if len(img_array.shape) == 3:
@@ -134,24 +144,72 @@ def preprocess_image(image: Image.Image, input_shape: tuple) -> np.ndarray:
     return img_array
 
 
-def postprocess_output(output_data: np.ndarray, conf_threshold: float = 0.15) -> Dict[str, int]:
+def postprocess_yolov5(
+    output_data: np.ndarray,
+    conf_threshold: float = 0.25,
+) -> Tuple[Dict[str, int], List[Dict[str, Any]]]:
+    """
+    YOLOv5 ONNX output: [1, N, 5+num_classes]
+    columns = x, y, w, h, objectness, class_scores...
+    """
     counts = {name: 0 for name in CLASS_NAMES}
+    details: List[Dict[str, Any]] = []
 
-    if len(output_data.shape) == 3:
+    if output_data.ndim == 3:
         detections = output_data[0]
-    elif len(output_data.shape) == 2:
+    elif output_data.ndim == 2:
         detections = output_data
     else:
-        return counts
+        return counts, details
 
-    for detection in detections:
-        if len(detection) >= 6:
-            conf = float(detection[4])
-            class_id = int(detection[5])
-            if conf >= conf_threshold and 0 <= class_id < len(CLASS_NAMES):
-                counts[CLASS_NAMES[class_id]] += 1
+    num_classes = len(CLASS_NAMES)
+    for det in detections:
+        if det.shape[0] < 5 + num_classes:
+            # fallback: old [x,y,w,h,conf,class_id]
+            if det.shape[0] >= 6:
+                conf = float(det[4])
+                class_id = int(det[5])
+                if conf >= conf_threshold and 0 <= class_id < num_classes:
+                    name = CLASS_NAMES[class_id]
+                    counts[name] += 1
+                    details.append(
+                        {
+                            "class": name,
+                            "confidence": round(conf, 4),
+                            "x": float(det[0]),
+                            "y": float(det[1]),
+                            "width": float(det[2]),
+                            "height": float(det[3]),
+                        }
+                    )
+            continue
 
-    return counts
+        objectness = float(det[4])
+        class_scores = det[5 : 5 + num_classes]
+        class_id = int(np.argmax(class_scores))
+        class_conf = float(class_scores[class_id])
+        conf = objectness * class_conf
+        if conf < conf_threshold:
+            continue
+        if not (0 <= class_id < num_classes):
+            continue
+
+        name = CLASS_NAMES[class_id]
+        counts[name] += 1
+        details.append(
+            {
+                "class": name,
+                "confidence": round(conf, 4),
+                "x": float(det[0]),
+                "y": float(det[1]),
+                "width": float(det[2]),
+                "height": float(det[3]),
+            }
+        )
+
+    # Keep highest-confidence boxes first
+    details.sort(key=lambda d: d["confidence"], reverse=True)
+    return counts, details
 
 
 def run_detection(image_bytes: bytes) -> Dict[str, Any]:
@@ -160,10 +218,12 @@ def run_detection(image_bytes: bytes) -> Dict[str, Any]:
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     t0 = time.time()
 
-    input_shape = input_details.shape if input_details.shape else [1, 3, 512, 512]
+    input_shape = input_details.shape if input_details.shape else [1, 3, 416, 416]
     input_data = preprocess_image(img, input_shape)
     output = session.run([output_details.name], {input_details.name: input_data})
-    counts = postprocess_output(output[0], conf_threshold=0.15)
+
+    conf = float(os.getenv("DETECT_CONFIDENCE", "0.25") or "0.25")
+    counts, predictions = postprocess_yolov5(output[0], conf_threshold=conf)
 
     recommendations = {k: v for k, v in PESTICIDE_RECS.items() if counts.get(k, 0) > 0}
     total = sum(counts.values())
@@ -173,9 +233,11 @@ def run_detection(image_bytes: bytes) -> Dict[str, Any]:
         "pest_counts": counts,
         "recommendations": recommendations,
         "total_pests_detected": total,
+        "predictions": predictions[:50],
         "inference_time_ms": round((time.time() - t0) * 1000, 1),
         "model": Path(model_path).name if model_path else "none",
-        "framework": "ONNX Runtime",
+        "framework": "ONNX Runtime (YOLOv5)",
+        "backend": "onnx",
     }
 
 
@@ -188,13 +250,15 @@ def health_payload() -> Dict[str, Any]:
         }
 
     try:
-        _, _, _, model_path = get_model()
+        _, input_details, _, model_path = get_model()
         return {
             "status": "ok",
             "model": Path(model_path).name if model_path else "none",
+            "input_shape": list(input_details.shape) if input_details is not None else None,
             "classes": CLASS_NAMES,
             "num_classes": len(CLASS_NAMES),
-            "framework": "ONNX Runtime",
+            "framework": "ONNX Runtime (YOLOv5)",
+            "backend": "onnx",
             "platform": "vercel",
         }
     except Exception as exc:

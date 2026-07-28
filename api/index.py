@@ -29,9 +29,9 @@ def root():
     health = health_payload()
     return jsonify({
         "name": "AgriShield Pest Detection API",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "platform": "vercel",
-        "framework": "ONNX Runtime",
+        "framework": health.get("framework", "ONNX Runtime (YOLOv5)"),
         "endpoints": {
             "health": "/health",
             "detect": "/detect (POST)",

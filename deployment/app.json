@@ -1,0 +1,27 @@
+{
+  "buildpacks": [
+    {
+      "url": "heroku/python"
+    }
+  ]
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

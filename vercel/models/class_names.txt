@@ -1,15 +1,6 @@
-0
-1
-2
-3
-4
-5
-6
-black bug
-brown plant hopper
-green leaf hopper
-object
-rice bug
-rice grasshopper
-rice leaf roller
-stem borer
+brown-planthopper
+green-leafhopper
+leaf-folder
+rice-bug
+stem-borer
+whorl-maggot

@@ -258,7 +258,7 @@ def _normalize_detections(output_data: np.ndarray) -> Tuple[np.ndarray, bool]:
 
 def postprocess_yolo(
     output_data: np.ndarray,
-    conf_threshold: float = 0.30,
+    conf_threshold: float = 0.20,
     iou_threshold: float = 0.45,
 ) -> Tuple[Dict[str, int], List[Dict[str, Any]]]:
     """
@@ -356,7 +356,7 @@ def run_detection(image_bytes: bytes) -> Dict[str, Any]:
     input_data = preprocess_image(img, input_shape)
     output = session.run([output_details.name], {input_details.name: input_data})
 
-    conf = float(os.getenv("DETECT_CONFIDENCE", "0.30") or "0.30")
+    conf = float(os.getenv("DETECT_CONFIDENCE", "0.20") or "0.20")
     iou = float(os.getenv("DETECT_IOU", "0.45") or "0.45")
     counts, predictions = postprocess_yolo(
         output[0],

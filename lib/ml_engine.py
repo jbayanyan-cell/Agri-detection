@@ -43,11 +43,19 @@ PESTICIDE_RECS = {
     "brown plant hopper": "Buprofezin or pymetrozine; reduce nitrogen; avoid broad-spectrum pyrethroids.",
     "green leaf hopper": "Imidacloprid or dinotefuran early; rotate MoA to avoid resistance.",
     "rice bug": "Use lambda-cyhalothrin or beta-cyfluthrin per label; avoid spraying near harvest.",
-    "rice grasshopper": "Spot-treat heavy infestations; conserve natural enemies when populations are low.",
-    "rice leaf roller": "Use cartap or chlorantraniliprole when leaf damage is rising.",
     "stem borer": "Use chlorantraniliprole or cartap early; remove stubbles after harvest.",
     "object": "Unclassified detection — verify in the field before treating.",
 }
+
+# Disabled for reporting (model may still score them; we ignore detections)
+DISABLED_CLASSES = frozenset({
+    "rice grasshopper",
+    "rice leaf roller",
+})
+
+
+def _is_disabled_class(name: str) -> bool:
+    return name.strip().lower() in DISABLED_CLASSES
 
 _session = None
 _input_details = None
@@ -74,6 +82,14 @@ def _load_class_names_file() -> Optional[List[str]]:
 
 def get_class_names() -> List[str]:
     return _load_class_names_file() or list(CLASS_NAMES)
+
+
+def get_reportable_class_names() -> List[str]:
+    """Class labels exposed in health/counts (excludes junk + disabled pests)."""
+    return [
+        n for n in get_class_names()
+        if n and not n.isdigit() and not _is_disabled_class(n)
+    ]
 
 
 def _model_candidates() -> list[Path]:
@@ -249,8 +265,8 @@ def postprocess_yolo(
     Support YOLOv11 [1, 4+nc, N] (no objectness) and YOLOv5 [1, N, 5+nc].
     """
     class_names = get_class_names()
-    # Report named pests (skip numeric placeholder labels from Roboflow export)
-    report_names = [n for n in class_names if not n.isdigit()]
+    # Report named pests (skip numeric placeholders and disabled classes)
+    report_names = get_reportable_class_names()
     counts = {name: 0 for name in report_names}
     candidates: List[Dict[str, Any]] = []
 
@@ -294,8 +310,8 @@ def postprocess_yolo(
         else:
             name = f"class_{class_id}"
 
-        # Skip numeric placeholder labels (Roboflow junk classes 0-6)
-        if name.isdigit():
+        # Skip numeric placeholder labels and disabled pest classes
+        if name.isdigit() or _is_disabled_class(name):
             continue
 
         candidates.append(
@@ -378,12 +394,13 @@ def health_payload() -> Dict[str, Any]:
     try:
         _, input_details, _, model_path = get_model()
         names = get_class_names()
-        reportable = [n for n in names if not n.isdigit()]
+        reportable = get_reportable_class_names()
         return {
             "status": "ok",
             "model": Path(model_path).name if model_path else "none",
             "input_shape": list(input_details.shape) if input_details is not None else None,
             "classes": reportable,
+            "disabled_classes": sorted(DISABLED_CLASSES),
             "num_classes": len(names),
             "framework": "ONNX Runtime (YOLOv11)",
             "backend": "onnx",

@@ -258,7 +258,7 @@ def _normalize_detections(output_data: np.ndarray) -> Tuple[np.ndarray, bool]:
 
 def postprocess_yolo(
     output_data: np.ndarray,
-    conf_threshold: float = 0.20,
+    conf_threshold: float = 0.15,
     iou_threshold: float = 0.45,
 ) -> Tuple[Dict[str, int], List[Dict[str, Any]]]:
     """

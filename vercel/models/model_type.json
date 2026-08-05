@@ -1,0 +1,5 @@
+{
+    "project_task_type": "object-detection",
+    "model_type": "yolov11n",
+    "model_id": "test-4fdzn/rice-pests-ajory-1-yolo11n-t1"
+}

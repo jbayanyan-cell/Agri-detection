@@ -1,4 +1,4 @@
-﻿"""Shared ONNX pest detection engine for Vercel (YOLOv11 rice-pests model)."""
+"""Shared ONNX pest detection engine for Vercel (YOLOv11 rice-pests model)."""
 
 from __future__ import annotations
 
@@ -43,19 +43,37 @@ PESTICIDE_RECS = {
     "brown plant hopper": "Buprofezin or pymetrozine; reduce nitrogen; avoid broad-spectrum pyrethroids.",
     "green leaf hopper": "Imidacloprid or dinotefuran early; rotate MoA to avoid resistance.",
     "rice bug": "Use lambda-cyhalothrin or beta-cyfluthrin per label; avoid spraying near harvest.",
+    "rice grasshopper": "Handpick when few; use carbaryl or lambda-cyhalothrin if heavy; protect field edges.",
+    "rice leaf roller": "Cartap or chlorantraniliprole early; avoid late unnecessary sprays.",
     "stem borer": "Use chlorantraniliprole or cartap early; remove stubbles after harvest.",
     "object": "Unclassified detection — verify in the field before treating.",
 }
 
-# Disabled for reporting (model may still score them; we ignore detections)
+# Numeric Roboflow duplicates → real pest names (same insects, two label systems)
+CLASS_ALIASES = {
+    "0": "black bug",
+    "1": "brown plant hopper",
+    "2": "green leaf hopper",
+    "3": "rice bug",
+    "4": "rice grasshopper",
+    "5": "rice leaf roller",
+    "6": "stem borer",
+}
+
+# Still ignored after aliasing (not a real pest class)
 DISABLED_CLASSES = frozenset({
-    "rice grasshopper",
-    "rice leaf roller",
+    "object",
 })
 
 
 def _is_disabled_class(name: str) -> bool:
     return name.strip().lower() in DISABLED_CLASSES
+
+
+def _canonicalize_class_name(name: str) -> str:
+    """Map duplicate numeric labels to canonical pest names."""
+    key = name.strip().lower()
+    return CLASS_ALIASES.get(key, name.strip())
 
 _session = None
 _input_details = None
@@ -85,11 +103,20 @@ def get_class_names() -> List[str]:
 
 
 def get_reportable_class_names() -> List[str]:
-    """Class labels exposed in health/counts (excludes junk + disabled pests)."""
-    return [
-        n for n in get_class_names()
-        if n and not n.isdigit() and not _is_disabled_class(n)
-    ]
+    """Canonical pest labels for health/counts (digits aliased; junk excluded)."""
+    seen = set()
+    names: List[str] = []
+    for raw in get_class_names():
+        if not raw:
+            continue
+        name = _canonicalize_class_name(raw)
+        if _is_disabled_class(name) or name.isdigit():
+            continue
+        if name in seen:
+            continue
+        seen.add(name)
+        names.append(name)
+    return names
 
 
 def _model_candidates() -> list[Path]:
@@ -310,8 +337,9 @@ def postprocess_yolo(
         else:
             name = f"class_{class_id}"
 
-        # Skip numeric placeholder labels and disabled pest classes
-        if name.isdigit() or _is_disabled_class(name):
+        # Alias 0–6 → real pests so both label systems count as one
+        name = _canonicalize_class_name(name)
+        if _is_disabled_class(name) or name.isdigit():
             continue
 
         candidates.append(
@@ -400,6 +428,7 @@ def health_payload() -> Dict[str, Any]:
             "model": Path(model_path).name if model_path else "none",
             "input_shape": list(input_details.shape) if input_details is not None else None,
             "classes": reportable,
+            "class_aliases": dict(CLASS_ALIASES),
             "disabled_classes": sorted(DISABLED_CLASSES),
             "num_classes": len(names),
             "framework": "ONNX Runtime (YOLOv11)",

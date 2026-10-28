@@ -239,7 +239,7 @@ def _box_iou(a: Tuple[float, float, float, float], b: Tuple[float, float, float,
 
 def _nms_per_class(
     candidates: List[Dict[str, Any]],
-    iou_threshold: float = 0.45,
+    iou_threshold: float = 0.30,
 ) -> List[Dict[str, Any]]:
     kept: List[Dict[str, Any]] = []
     by_class: Dict[str, List[Dict[str, Any]]] = {}
@@ -286,7 +286,7 @@ def _normalize_detections(output_data: np.ndarray) -> Tuple[np.ndarray, bool]:
 def postprocess_yolo(
     output_data: np.ndarray,
     conf_threshold: float = 0.15,
-    iou_threshold: float = 0.45,
+    iou_threshold: float = 0.30,
 ) -> Tuple[Dict[str, int], List[Dict[str, Any]]]:
     """
     Support YOLOv11 [1, 4+nc, N] (no objectness) and YOLOv5 [1, N, 5+nc].
@@ -384,8 +384,10 @@ def run_detection(image_bytes: bytes) -> Dict[str, Any]:
     input_data = preprocess_image(img, input_shape)
     output = session.run([output_details.name], {input_details.name: input_data})
 
-    conf = float(os.getenv("DETECT_CONFIDENCE", "0.20") or "0.20")
-    iou = float(os.getenv("DETECT_IOU", "0.45") or "0.45")
+    # Dense field clusters (e.g. black-bug swarms): keep more overlapping boxes.
+    conf = float(os.getenv("DETECT_CONFIDENCE", "0.15") or "0.15")
+    iou = float(os.getenv("DETECT_IOU", "0.30") or "0.30")
+    max_preds = int(os.getenv("DETECT_MAX_PREDICTIONS", "300") or "300")
     counts, predictions = postprocess_yolo(
         output[0],
         conf_threshold=conf,
@@ -394,13 +396,15 @@ def run_detection(image_bytes: bytes) -> Dict[str, Any]:
 
     recommendations = {k: v for k, v in PESTICIDE_RECS.items() if counts.get(k, 0) > 0}
     total = sum(counts.values())
+    if max_preds < 1:
+        max_preds = 300
 
     return {
         "status": "success",
         "pest_counts": counts,
         "recommendations": recommendations,
         "total_pests_detected": total,
-        "predictions": predictions[:50],
+        "predictions": predictions[:max_preds],
         "inference_time_ms": round((time.time() - t0) * 1000, 1),
         "model": Path(model_path).name if model_path else "none",
         "framework": "ONNX Runtime (YOLOv11)",
@@ -408,6 +412,7 @@ def run_detection(image_bytes: bytes) -> Dict[str, Any]:
         "count_method": "per_class_nms",
         "confidence_threshold": conf,
         "iou_threshold": iou,
+        "max_predictions": max_preds,
     }
 
 

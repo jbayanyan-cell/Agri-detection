@@ -31,7 +31,7 @@ def root():
         "name": "AgriShield Pest Detection API",
         "version": "1.1.0",
         "platform": "vercel",
-        "framework": health.get("framework", "ONNX Runtime (YOLOv5)"),
+        "framework": health.get("framework", "ONNX Runtime (YOLOv11)"),
         "endpoints": {
             "health": "/health",
             "detect": "/detect (POST)",

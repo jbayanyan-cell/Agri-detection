@@ -283,26 +283,26 @@ def _normalize_detections(output_data: np.ndarray) -> Tuple[np.ndarray, bool]:
     return arr, channel_first
 
 
-def postprocess_yolo(
+def _extract_candidates(
     output_data: np.ndarray,
-    conf_threshold: float = 0.15,
-    iou_threshold: float = 0.30,
-) -> Tuple[Dict[str, int], List[Dict[str, Any]]]:
+    conf_threshold: float,
+    scale_x: float = 1.0,
+    scale_y: float = 1.0,
+    offset_x: float = 0.0,
+    offset_y: float = 0.0,
+) -> List[Dict[str, Any]]:
     """
-    Support YOLOv11 [1, 4+nc, N] (no objectness) and YOLOv5 [1, N, 5+nc].
+    Decode YOLO outputs into candidates in original-image pixel space.
+    Supports YOLOv11 [1, 4+nc, N] and YOLOv5 [1, N, 5+nc].
     """
     class_names = get_class_names()
-    # Report named pests (skip numeric placeholders and disabled classes)
-    report_names = get_reportable_class_names()
-    counts = {name: 0 for name in report_names}
     candidates: List[Dict[str, Any]] = []
 
     detections, channel_first = _normalize_detections(output_data)
     if detections.size == 0:
-        return counts, []
+        return candidates
 
     channels = int(detections.shape[1])
-    # Channel-first ONNX (YOLOv8/11): no objectness. Row-major YOLOv5: objectness.
     if channel_first:
         has_objectness = False
         model_nc = max(1, channels - 4)
@@ -323,12 +323,7 @@ def postprocess_yolo(
 
         class_id = int(np.argmax(class_scores))
         class_conf = float(class_scores[class_id])
-
-        if has_objectness:
-            conf = float(det[4]) * class_conf
-        else:
-            conf = class_conf
-
+        conf = float(det[4]) * class_conf if has_objectness else class_conf
         if conf < conf_threshold:
             continue
 
@@ -337,11 +332,15 @@ def postprocess_yolo(
         else:
             name = f"class_{class_id}"
 
-        # Alias 0–6 → real pests so both label systems count as one
         name = _canonicalize_class_name(name)
         if _is_disabled_class(name) or name.isdigit():
             continue
 
+        # Map from model-input coords → crop/original pixel coords
+        cx = cx * scale_x + offset_x
+        cy = cy * scale_y + offset_y
+        bw = bw * scale_x
+        bh = bh * scale_y
         candidates.append(
             {
                 "class": name,
@@ -354,8 +353,84 @@ def postprocess_yolo(
             }
         )
 
-    kept = _nms_per_class(candidates, iou_threshold=iou_threshold)
+    return candidates
 
+
+def _model_hw(input_details) -> Tuple[int, int]:
+    shape = input_details.shape if input_details.shape else [1, 3, 640, 640]
+    if len(shape) == 4:
+        if shape[1] == 3:
+            return int(shape[2]), int(shape[3])
+        return int(shape[1]), int(shape[2])
+    return 640, 640
+
+
+def _infer_crop(
+    session,
+    input_details,
+    output_details,
+    crop: Image.Image,
+    conf_threshold: float,
+    offset_x: float = 0.0,
+    offset_y: float = 0.0,
+) -> List[Dict[str, Any]]:
+    """Run one forward pass on a crop; return boxes in full-image coords."""
+    mh, mw = _model_hw(input_details)
+    cw, ch = crop.size
+    if cw < 1 or ch < 1:
+        return []
+    input_shape = input_details.shape if input_details.shape else [1, 3, mh, mw]
+    input_data = preprocess_image(crop, input_shape)
+    output = session.run([output_details.name], {input_details.name: input_data})
+    return _extract_candidates(
+        output[0],
+        conf_threshold=conf_threshold,
+        scale_x=cw / float(mw),
+        scale_y=ch / float(mh),
+        offset_x=offset_x,
+        offset_y=offset_y,
+    )
+
+
+def _tile_windows(
+    width: int,
+    height: int,
+    grid: int,
+    overlap: float,
+) -> List[Tuple[int, int, int, int]]:
+    """Axis-aligned overlapping tiles as (x1, y1, x2, y2)."""
+    grid = max(1, grid)
+    overlap = min(0.5, max(0.0, overlap))
+    if grid == 1:
+        return [(0, 0, width, height)]
+
+    windows: List[Tuple[int, int, int, int]] = []
+    step_x = width / grid
+    step_y = height / grid
+    tile_w = int(round(step_x * (1.0 + overlap)))
+    tile_h = int(round(step_y * (1.0 + overlap)))
+    tile_w = min(width, max(tile_w, int(round(step_x))))
+    tile_h = min(height, max(tile_h, int(round(step_y))))
+
+    for gy in range(grid):
+        for gx in range(grid):
+            x1 = int(round(gx * step_x))
+            y1 = int(round(gy * step_y))
+            if gx == grid - 1:
+                x1 = max(0, width - tile_w)
+            if gy == grid - 1:
+                y1 = max(0, height - tile_h)
+            x2 = min(width, x1 + tile_w)
+            y2 = min(height, y1 + tile_h)
+            windows.append((x1, y1, x2, y2))
+    return windows
+
+
+def _candidates_to_counts_and_details(
+    kept: List[Dict[str, Any]],
+) -> Tuple[Dict[str, int], List[Dict[str, Any]]]:
+    report_names = get_reportable_class_names()
+    counts = {name: 0 for name in report_names}
     details: List[Dict[str, Any]] = []
     for item in kept:
         name = item["class"]
@@ -370,8 +445,18 @@ def postprocess_yolo(
                 "height": float(item["height"]),
             }
         )
-
     return counts, details
+
+
+def postprocess_yolo(
+    output_data: np.ndarray,
+    conf_threshold: float = 0.10,
+    iou_threshold: float = 0.20,
+) -> Tuple[Dict[str, int], List[Dict[str, Any]]]:
+    """Single-pass decode + NMS (kept for compatibility)."""
+    candidates = _extract_candidates(output_data, conf_threshold=conf_threshold)
+    kept = _nms_per_class(candidates, iou_threshold=iou_threshold)
+    return _candidates_to_counts_and_details(kept)
 
 
 def run_detection(image_bytes: bytes) -> Dict[str, Any]:
@@ -380,24 +465,58 @@ def run_detection(image_bytes: bytes) -> Dict[str, Any]:
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     t0 = time.time()
 
-    input_shape = input_details.shape if input_details.shape else [1, 3, 640, 640]
-    input_data = preprocess_image(img, input_shape)
-    output = session.run([output_details.name], {input_details.name: input_data})
+    # Dense swarms: low conf + soft NMS + overlapping tiles so small bugs survive resize.
+    conf = float(os.getenv("DETECT_CONFIDENCE", "0.08") or "0.08")
+    iou = float(os.getenv("DETECT_IOU", "0.20") or "0.20")
+    max_preds = int(os.getenv("DETECT_MAX_PREDICTIONS", "500") or "500")
+    use_tiles = (os.getenv("DETECT_TILES", "1") or "1").strip().lower() not in {
+        "0", "false", "off", "no",
+    }
+    tile_grid = int(os.getenv("DETECT_TILE_GRID", "2") or "2")
+    tile_overlap = float(os.getenv("DETECT_TILE_OVERLAP", "0.30") or "0.30")
+    if max_preds < 1:
+        max_preds = 500
 
-    # Dense field clusters (e.g. black-bug swarms): keep more overlapping boxes.
-    conf = float(os.getenv("DETECT_CONFIDENCE", "0.15") or "0.15")
-    iou = float(os.getenv("DETECT_IOU", "0.30") or "0.30")
-    max_preds = int(os.getenv("DETECT_MAX_PREDICTIONS", "300") or "300")
-    counts, predictions = postprocess_yolo(
-        output[0],
-        conf_threshold=conf,
-        iou_threshold=iou,
+    orig_w, orig_h = img.size
+    all_candidates: List[Dict[str, Any]] = []
+
+    # Full-frame pass
+    all_candidates.extend(
+        _infer_crop(session, input_details, output_details, img, conf)
     )
+
+    # Tile passes — critical for packed black-bug clusters
+    tile_runs = 0
+    if use_tiles and tile_grid > 1 and orig_w >= 320 and orig_h >= 320:
+        for x1, y1, x2, y2 in _tile_windows(orig_w, orig_h, tile_grid, tile_overlap):
+            crop = img.crop((x1, y1, x2, y2))
+            all_candidates.extend(
+                _infer_crop(
+                    session,
+                    input_details,
+                    output_details,
+                    crop,
+                    conf,
+                    offset_x=float(x1),
+                    offset_y=float(y1),
+                )
+            )
+            tile_runs += 1
+
+    kept = _nms_per_class(all_candidates, iou_threshold=iou)
+    counts, predictions = _candidates_to_counts_and_details(kept)
 
     recommendations = {k: v for k, v in PESTICIDE_RECS.items() if counts.get(k, 0) > 0}
     total = sum(counts.values())
-    if max_preds < 1:
-        max_preds = 300
+
+    dominant = "no_pest_detected"
+    dominant_conf = 0.0
+    common_name = "No Pest Detected"
+    if total > 0:
+        dominant = max(counts.items(), key=lambda kv: kv[1])[0]
+        class_preds = [p for p in predictions if p["class"] == dominant]
+        dominant_conf = max((p["confidence"] for p in class_preds), default=0.0)
+        common_name = dominant.title()
 
     return {
         "status": "success",
@@ -405,14 +524,20 @@ def run_detection(image_bytes: bytes) -> Dict[str, Any]:
         "recommendations": recommendations,
         "total_pests_detected": total,
         "predictions": predictions[:max_preds],
+        "detections": predictions[:max_preds],
+        "predicted_class": dominant,
+        "confidence": round(float(dominant_conf), 4),
+        "common_name": common_name,
         "inference_time_ms": round((time.time() - t0) * 1000, 1),
         "model": Path(model_path).name if model_path else "none",
         "framework": "ONNX Runtime (YOLOv11)",
         "backend": "onnx",
-        "count_method": "per_class_nms",
+        "count_method": "tiled_per_class_nms" if tile_runs else "per_class_nms",
         "confidence_threshold": conf,
         "iou_threshold": iou,
         "max_predictions": max_preds,
+        "tile_grid": tile_grid if tile_runs else 1,
+        "tile_runs": tile_runs,
     }
 
 
